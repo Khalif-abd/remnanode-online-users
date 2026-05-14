@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+BIN_NAME="remnanode-online-users"
+REPO_RAW_URL="https://raw.githubusercontent.com/Khalif-abd/remnanode-online-users/main/remnanode-online-users"
+INSTALL_PATH="/usr/local/bin/${BIN_NAME}"
+
+LOG_FILE="/var/log/remnanode/access.log"
+MODE="snapshot"
+WINDOW_SECONDS=60
+OUTPUT="text"
+TAIL_LINES=200000
+MAX_WINDOW_SECONDS=180
+
+usage() {
+  cat <<EOF
+Usage:
+  remnanode-online-users [options]
+  remnanode-online-users @ install
+  remnanode-online-users @ uninstall
+
+Options:
+  --file PATH          Path to access.log. Default: /var/log/remnanode/access.log
+  --seconds N          Window in seconds. Max: 180. Default: 60
+  --minutes N          Window in minutes. Max: 3. Default: 1
+  --tail-lines N       Last log lines to scan in snapshot mode. Default: 200000
+  --live               Live mode. Prints stats every window interval.
+  --json               Output JSON.
+  -h, --help           Show help.
+
+Examples:
+  remnanode-online-users
+  remnanode-online-users --seconds 30
+  remnanode-online-users --minutes 2
+  remnanode-online-users --json
+  remnanode-online-users --live
+  remnanode-online-users --live --seconds 30
+
+Run without installation:
+  bash <(curl -Ls ${REPO_RAW_URL})
+
+Install:
+  bash <(curl -Ls ${REPO_RAW_URL}) @ install
+
+Uninstall:
+  remnanode-online-users @ uninstall
+EOF
+}
+
+error() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+self_install() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    error "install requires root privileges. Run: sudo bash -c 'bash <(curl -Ls ${REPO_RAW_URL}) @ install'"
+  fi
+
+  command -v curl >/dev/null 2>&1 || error "curl is required"
+
+  echo "Installing ${BIN_NAME} to ${INSTALL_PATH}..."
+
+  curl -Ls "${REPO_RAW_URL}" -o "${INSTALL_PATH}"
+  chmod +x "${INSTALL_PATH}"
+
+  echo "Installed successfully: ${INSTALL_PATH}"
+  echo
+  "${INSTALL_PATH}" --help
+}
+
+self_uninstall() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    error "uninstall requires root privileges"
+  fi
+
+  rm -f "${INSTALL_PATH}"
+  echo "Removed: ${INSTALL_PATH}"
+}
+
+if [[ "${1:-}" == "@" ]]; then
+  case "${2:-}" in
+    install)
+      self_install
+      exit 0
+      ;;
+    uninstall)
+      self_uninstall
+      exit 0
+      ;;
+    *)
+      echo "Unknown @ command: ${2:-}" >&2
+      echo "Available commands:" >&2
+      echo "  @ install" >&2
+      echo "  @ uninstall" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --file)
+      [[ $# -ge 2 ]] || error "--file requires a value"
+      LOG_FILE="$2"
+      shift 2
+      ;;
+    --seconds)
+      [[ $# -ge 2 ]] || error "--seconds requires a value"
+      WINDOW_SECONDS="$2"
+      shift 2
+      ;;
+    --minutes)
+      [[ $# -ge 2 ]] || error "--minutes requires a value"
+      [[ "$2" =~ ^[0-9]+$ ]] || error "Invalid minutes: $2"
+      WINDOW_SECONDS=$(( "$2" * 60 ))
+      shift 2
+      ;;
+    --tail-lines)
+      [[ $# -ge 2 ]] || error "--tail-lines requires a value"
+      TAIL_LINES="$2"
+      shift 2
+      ;;
+    --live)
+      MODE="live"
+      shift
+      ;;
+    --json)
+      OUTPUT="json"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      error "Unknown option: $1"
+      ;;
+  esac
+done
+
+[[ "$WINDOW_SECONDS" =~ ^[0-9]+$ ]] || error "Invalid window seconds: $WINDOW_SECONDS"
+[[ "$TAIL_LINES" =~ ^[0-9]+$ ]] || error "Invalid tail lines: $TAIL_LINES"
+
+(( WINDOW_SECONDS >= 1 )) || error "Window must be >= 1 second"
+(( WINDOW_SECONDS <= MAX_WINDOW_SECONDS )) || error "Window too large: ${WINDOW_SECONDS}s. Max allowed: ${MAX_WINDOW_SECONDS}s"
+
+if [[ ! -e "$LOG_FILE" ]]; then
+  error "Log file does not exist: $LOG_FILE"
+fi
+
+if [[ ! -f "$LOG_FILE" ]]; then
+  error "Path exists, but it is not a regular file: $LOG_FILE"
+fi
+
+if [[ ! -r "$LOG_FILE" ]]; then
+  error "Log file is not readable: $LOG_FILE"
+fi
+
+run_awk() {
+  local since_string="$1"
+  local timestamp="$2"
+
+  awk \
+    -v since="$since_string" \
+    -v window_seconds="$WINDOW_SECONDS" \
+    -v timestamp="$timestamp" \
+    -v output="$OUTPUT" '
+function strip_port(addr) {
+  sub(/:[0-9]+$/, "", addr)
+  return addr
+}
+
+{
+  # Expected log timestamp format:
+  # 2026/05/14 09:48:14.123456
+  ts = substr($1 " " $2, 1, 19)
+
+  if (ts < since) {
+    next
+  }
+
+  total_lines++
+
+  if ($0 ~ / accepted /) {
+    accepted++
+  } else if ($0 ~ / rejected /) {
+    rejected++
+  }
+
+  ip = ""
+  user_id = ""
+
+  for (i = 1; i <= NF; i++) {
+    if ($i == "from") {
+      ip = strip_port($(i + 1))
+    }
+
+    # In Remnawave/Xray access.log this field is called "email",
+    # but it often contains user/subscription ID.
+    if ($i == "email:") {
+      user_id = $(i + 1)
+    }
+  }
+
+  if (user_id != "" && !(user_id in user_ids)) {
+    user_ids[user_id] = 1
+    unique_user_id++
+  }
+
+  if (ip != "" && !(ip in ips)) {
+    ips[ip] = 1
+    unique_ip++
+  }
+
+  if (user_id != "" && ip != "") {
+    pair = user_id "|" ip
+    if (!(pair in user_ip_pairs)) {
+      user_ip_pairs[pair] = 1
+      unique_user_ip++
+    }
+  }
+}
+
+END {
+  # Main metric:
+  # online_users = unique user_id + IP pairs
+  online_users = unique_user_ip
+
+  if (output == "json") {
+    printf "{"
+    printf "\"timestamp\":\"%s\",", timestamp
+    printf "\"window_seconds\":%d,", window_seconds
+    printf "\"online_users\":%d,", online_users
+    printf "\"unique_user_ids\":%d,", unique_user_id
+    printf "\"unique_ips\":%d,", unique_ip
+    printf "\"unique_user_id_ip\":%d,", unique_user_ip
+    printf "\"accepted\":%d,", accepted
+    printf "\"rejected\":%d,", rejected
+    printf "\"total_lines\":%d", total_lines
+    printf "}\n"
+  } else {
+    printf "timestamp=\"%s\" window=%ds online_users=%d user_ids=%d ips=%d user_id_ip=%d accepted=%d rejected=%d lines=%d\n",
+      timestamp, window_seconds, online_users, unique_user_id, unique_ip, unique_user_ip, accepted, rejected, total_lines
+  }
+}
+'
+}
+
+snapshot() {
+  local since_string
+  local timestamp
+
+  since_string="$(date -d "${WINDOW_SECONDS} seconds ago" '+%Y/%m/%d %H:%M:%S')"
+  timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+
+  tail -n "$TAIL_LINES" "$LOG_FILE" | run_awk "$since_string" "$timestamp"
+}
+
+live() {
+  if [[ "$OUTPUT" == "json" ]]; then
+    echo "Live mode enabled. Window: ${WINDOW_SECONDS}s. Reading: $LOG_FILE" >&2
+    echo "Press Ctrl+C to stop" >&2
+  else
+    echo "Live mode. Window: ${WINDOW_SECONDS}s. Reading: $LOG_FILE"
+    echo "Press Ctrl+C to stop"
+    echo
+  fi
+
+  while true; do
+    snapshot
+    sleep "$WINDOW_SECONDS"
+  done
+}
+
+if [[ "$MODE" == "live" ]]; then
+  live
+else
+  snapshot
+fi
