@@ -249,10 +249,23 @@ END {
 }
 
 snapshot() {
+  local latest_log_ts
   local since_string
   local timestamp
 
-  since_string="$(date -d "${WINDOW_SECONDS} seconds ago" '+%Y/%m/%d %H:%M:%S')"
+  latest_log_ts="$(
+    tail -n "$TAIL_LINES" "$LOG_FILE" \
+      | awk '$1 ~ /^[0-9]{4}\/[0-9]{2}\/[0-9]{2}$/ { ts = substr($1 " " $2, 1, 19) } END { print ts }'
+  )"
+
+  if [[ -z "$latest_log_ts" ]]; then
+    error "Could not find valid timestamp in log file: $LOG_FILE"
+  fi
+
+  since_string="$(
+    date -d "${latest_log_ts//\//-} ${WINDOW_SECONDS} seconds ago" '+%Y/%m/%d %H:%M:%S'
+  )"
+
   timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
 
   tail -n "$TAIL_LINES" "$LOG_FILE" | run_awk "$since_string" "$timestamp"
